@@ -1,0 +1,27 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — never commit real values.
+
+region      = "us-east-1"
+alert_email = "yourteam@company.com"
+
+# Cost allocation tags (applied to every resource via provider default_tags)
+cost_center = "ENG-001"
+environment = "dev"
+project     = "cost-detective"
+owner       = "platform@company.com"
+
+# Budget
+budget_limit_usd = 50
+
+# Config — set true only if AWS Config is not already enabled in this account/region
+enable_config_recorder = false
+
+# ASG sizing
+min_capacity                    = 1
+max_capacity                    = 6
+desired_capacity                = 2
+on_demand_base_capacity         = 1
+on_demand_percentage_above_base = 25
+
+# Leave empty to use SSM Session Manager for access (recommended)
+key_pair_name = ""

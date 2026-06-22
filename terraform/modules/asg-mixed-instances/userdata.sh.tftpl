@@ -1,0 +1,32 @@
+#!/bin/bash
+set -euo pipefail
+yum update -y
+yum install -y httpd
+systemctl start httpd
+systemctl enable httpd
+
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+INSTANCE_TYPE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-type)
+AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+LIFECYCLE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-life-cycle 2>/dev/null || echo "normal")
+
+cat > /var/www/html/index.html <<HTML
+<!DOCTYPE html>
+<html>
+<head><title>Cost Detective — Mixed Instance Demo</title></head>
+<body style="font-family: monospace; padding: 2em;">
+  <h2>Cost Detective — Spot/On-Demand Mixed Instance Demo</h2>
+  <table border="1" cellpadding="8">
+    <tr><td>Instance ID</td><td>$INSTANCE_ID</td></tr>
+    <tr><td>Instance Type</td><td>$INSTANCE_TYPE</td></tr>
+    <tr><td>Availability Zone</td><td>$AZ</td></tr>
+    <tr><td>Lifecycle</td><td><strong>$LIFECYCLE</strong></td></tr>
+    <tr><td>Project</td><td>${project}</td></tr>
+    <tr><td>Environment</td><td>${environment}</td></tr>
+  </table>
+  <p>Lifecycle = <code>spot</code> → running at ~70% discount vs On-Demand</p>
+</body>
+</html>
+HTML
