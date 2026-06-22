@@ -1,0 +1,435 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cost Detective – Auto Scaling Group with Mixed Instances Policy.
+  Demonstrates a cost-optimised stateless workload using:
+    - 1x On-Demand base capacity (reliability floor)
+    - 25% of scale-out as On-Demand (predictable cost)
+    - 75% of scale-out as Spot Instances (up to 70% savings)
+  Multiple instance types are specified to maximise Spot pool
+  availability and minimise interruption risk.
+
+Parameters:
+  # ── Network ──────────────────────────────────────────────────────────────
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+
+  Subnet1Cidr:
+    Type: String
+    Default: "10.0.1.0/24"
+
+  Subnet2Cidr:
+    Type: String
+    Default: "10.0.2.0/24"
+
+  # ── Instance config ───────────────────────────────────────────────────────
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI (auto-resolved via SSM Parameter Store)
+
+  KeyPairName:
+    Type: String
+    Default: ""
+    Description: EC2 Key Pair for SSH access (leave empty for SSM-only access)
+
+  # ── Scaling ───────────────────────────────────────────────────────────────
+  MinCapacity:
+    Type: Number
+    Default: 1
+    Description: Minimum number of instances in the ASG
+
+  MaxCapacity:
+    Type: Number
+    Default: 6
+    Description: Maximum number of instances in the ASG
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Initial desired count
+
+  OnDemandBaseCapacity:
+    Type: Number
+    Default: 1
+    Description: Number of On-Demand instances to maintain as a reliability floor
+
+  OnDemandPercentageAboveBase:
+    Type: Number
+    Default: 25
+    Description: Percentage of scale-out instances to launch On-Demand (rest are Spot)
+
+  # ── Cost allocation ───────────────────────────────────────────────────────
+  CostCenter:
+    Type: String
+    Default: "PLATFORM-001"
+    Description: CostCenter tag value for all resources
+
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues: [prod, staging, dev, sandbox]
+
+  Project:
+    Type: String
+    Default: "cost-detective"
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, ""]]
+
+Resources:
+
+  # ── VPC and Networking ────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${Project}-vpc"
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${Project}-igw"
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref Subnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${Project}-public-subnet-1"
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref Subnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${Project}-public-subnet-2"
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${Project}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── Security Group ────────────────────────────────────────────────────────
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow HTTP/HTTPS inbound; all outbound"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+          Description: HTTP
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: HTTPS
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: All outbound
+      Tags:
+        - Key: Name
+          Value: !Sub "${Project}-web-sg"
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role for EC2 instances ────────────────────────────────────────────
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-ec2-role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore  # SSM Session Manager
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${Project}-instance-profile-${AWS::StackName}"
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ── Launch Template ───────────────────────────────────────────────────────
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${Project}-launch-template"
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        # NOTE: No instance type here — the ASG Mixed Instances Policy overrides it
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebSecurityGroup
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref AWS::NoValue]
+        Monitoring:
+          Enabled: true    # Detailed monitoring (1-min CloudWatch metrics)
+        MetadataOptions:
+          HttpTokens: required          # Enforce IMDSv2
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            yum update -y
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+
+            # Instance identity metadata
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            INSTANCE_TYPE=$(curl -s http://169.254.169.254/latest/meta-data/instance-type)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            LIFECYCLE=$(curl -s http://169.254.169.254/latest/meta-data/instance-life-cycle 2>/dev/null || echo "unknown")
+
+            cat > /var/www/html/index.html <<HTML
+            <!DOCTYPE html>
+            <html>
+            <head><title>Cost Detective - Mixed Instance Demo</title></head>
+            <body style="font-family: monospace; padding: 2em;">
+              <h2>Cost Detective — Spot/On-Demand Mixed Instance Demo</h2>
+              <table border="1" cellpadding="8">
+                <tr><td>Instance ID</td><td>${!INSTANCE_ID}</td></tr>
+                <tr><td>Instance Type</td><td>${!INSTANCE_TYPE}</td></tr>
+                <tr><td>Availability Zone</td><td>${!AZ}</td></tr>
+                <tr><td>Lifecycle</td><td><strong>${!LIFECYCLE}</strong></td></tr>
+                <tr><td>CostCenter</td><td>${CostCenter}</td></tr>
+                <tr><td>Environment</td><td>${Environment}</td></tr>
+              </table>
+              <p>Lifecycle = <code>spot</code> → running at ~70% discount vs On-Demand</p>
+            </body>
+            </html>
+            HTML
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${Project}-web-instance"
+              - Key: CostCenter
+                Value: !Ref CostCenter
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Project
+                Value: !Ref Project
+              - Key: Owner
+                Value: platform-team
+          - ResourceType: volume
+            Tags:
+              - Key: CostCenter
+                Value: !Ref CostCenter
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Project
+                Value: !Ref Project
+
+  # ── Auto Scaling Group with Mixed Instances Policy ─────────────────────────
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${Project}-asg"
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 120
+      DefaultInstanceWarmup: 60
+
+      # ── Mixed Instances Policy ──────────────────────────────────────────
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref WebLaunchTemplate
+            Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+
+          # ── Instance Type Overrides (Spot pool diversification) ─────────
+          # Multiple similar types: maximises Spot availability across pools.
+          # Use ec2-instance-selector to find cost-comparable alternatives.
+          Overrides:
+            - InstanceType: t3.micro
+            - InstanceType: t3a.micro
+            - InstanceType: t2.micro
+            - InstanceType: t3.small
+            - InstanceType: t3a.small
+            - InstanceType: t3.medium
+            - InstanceType: t3a.medium
+
+        InstancesDistribution:
+          # Base On-Demand capacity (reliability floor — never replaced by Spot)
+          OnDemandBaseCapacity: !Ref OnDemandBaseCapacity
+          # Above the base: X% On-Demand, rest is Spot
+          OnDemandPercentageAboveBaseCapacity: !Ref OnDemandPercentageAboveBase
+          # Spot allocation: lowest-price across pools (best for cost)
+          # Alternatives: capacity-optimized (best for availability)
+          SpotAllocationStrategy: price-capacity-optimized
+          OnDemandAllocationStrategy: lowest-price
+
+      # Propagate ASG tags to launched instances
+      Tags:
+        - Key: Name
+          Value: !Sub "${Project}-asg-instance"
+          PropagateAtLaunch: true
+        - Key: CostCenter
+          Value: !Ref CostCenter
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref Project
+          PropagateAtLaunch: true
+        - Key: ManagedBy
+          Value: CloudFormation
+          PropagateAtLaunch: true
+
+    # Replace instances on launch template update
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 2
+        PauseTime: PT2M
+        WaitOnResourceSignals: false
+
+  # ── Scaling Policies ──────────────────────────────────────────────────────
+  CPUScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0        # Scale out when average CPU > 60%
+        DisableScaleIn: false
+
+  # ── CloudWatch: Spot interruption alarm ───────────────────────────────────
+  SpotInterruptionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-spot-interruption-rate"
+      AlarmDescription: "High Spot Instance interruption rate — consider switching to capacity-optimized strategy"
+      MetricName: EC2SpotInterruptions
+      Namespace: AWS/AutoScaling
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebAutoScalingGroup
+
+# ── Outputs ────────────────────────────────────────────────────────────────
+Outputs:
+  ASGName:
+    Description: Auto Scaling Group name
+    Value: !Ref WebAutoScalingGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ASGName"
+
+  LaunchTemplateId:
+    Description: Launch Template ID
+    Value: !Ref WebLaunchTemplate
+    Export:
+      Name: !Sub "${AWS::StackName}-LaunchTemplateId"
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  CostBreakdownNote:
+    Description: Estimated savings vs all-On-Demand
+    Value: !Sub >
+      With OnDemandBase=${OnDemandBaseCapacity} and OnDemandPercentAboveBase=${OnDemandPercentageAboveBase}%,
+      approximately ${OnDemandPercentageAboveBase}% of scale-out instances are On-Demand and
+      the rest are Spot — typically 60-70% cheaper than On-Demand pricing.
+
+  ASGConsoleURL:
+    Description: Direct link to the ASG in the console
+    Value: !Sub "https://console.aws.amazon.com/ec2/autoscaling/home?region=${AWS::Region}#AutoScalingGroups:id=${Project}-asg"

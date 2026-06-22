@@ -1,0 +1,130 @@
+{
+  "_comment": [
+    "Cost Detective — Service Control Policy: Require CostCenter tag on EC2 Launch",
+    "",
+    "PURPOSE:",
+    "  Prevents any principal in the attached OU/account from calling",
+    "  ec2:RunInstances unless the request includes a 'CostCenter' tag.",
+    "  This is a preventive control — it blocks the action at the API level",
+    "  BEFORE the resource is created, unlike Config rules (detective controls).",
+    "",
+    "ATTACH TO:",
+    "  - An AWS Organizations OU (recommended) via the AWS Organizations console",
+    "  - Or directly to a target account",
+    "  NOTE: SCPs do not affect the management (root) account.",
+    "",
+    "EXCLUSIONS:",
+    "  The policy exempts specific IAM roles that may legitimately",
+    "  launch infrastructure without tags (e.g., CloudFormation service role,",
+    "  break-glass roles). Update the NotPrincipal / ArnNotLike list to match",
+    "  your organisation's role naming convention.",
+    "",
+    "TESTING:",
+    "  Use the IAM Policy Simulator or try launching an EC2 instance without",
+    "  the CostCenter tag — the request should fail with:",
+    "  'An error occurred (UnauthorizedOperation): ...'",
+    "",
+    "REFERENCES:",
+    "  https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html",
+    "  https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html#condition-keys-requestedregion"
+  ],
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyEC2RunInstancesWithoutCostCenterTag",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:instance/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/CostCenter": "true"
+        },
+        "ArnNotLike": {
+          "aws:PrincipalARN": [
+            "arn:aws:iam::*:role/CloudFormationServiceRole",
+            "arn:aws:iam::*:role/BreakGlassAdmin",
+            "arn:aws:iam::*:role/OrganizationAccountAccessRole",
+            "arn:aws:iam::*:role/AWSServiceRole*",
+            "arn:aws:iam::*:role/aws-service-role/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyEBSCreateWithoutCostCenterTag",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:CreateVolume"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:volume/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/CostCenter": "true"
+        },
+        "ArnNotLike": {
+          "aws:PrincipalARN": [
+            "arn:aws:iam::*:role/CloudFormationServiceRole",
+            "arn:aws:iam::*:role/BreakGlassAdmin",
+            "arn:aws:iam::*:role/OrganizationAccountAccessRole",
+            "arn:aws:iam::*:role/AWSServiceRole*",
+            "arn:aws:iam::*:role/aws-service-role/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyEC2RunInstancesWithoutEnvironmentTag",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:instance/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/Environment": "true"
+        },
+        "ArnNotLike": {
+          "aws:PrincipalARN": [
+            "arn:aws:iam::*:role/CloudFormationServiceRole",
+            "arn:aws:iam::*:role/BreakGlassAdmin",
+            "arn:aws:iam::*:role/OrganizationAccountAccessRole",
+            "arn:aws:iam::*:role/AWSServiceRole*",
+            "arn:aws:iam::*:role/aws-service-role/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyTagRemovalFromTaggedResources",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:DeleteTags"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ForAnyValue:StringEquals": {
+          "aws:TagKeys": [
+            "CostCenter",
+            "Environment",
+            "Project",
+            "Owner"
+          ]
+        },
+        "ArnNotLike": {
+          "aws:PrincipalARN": [
+            "arn:aws:iam::*:role/BreakGlassAdmin",
+            "arn:aws:iam::*:role/OrganizationAccountAccessRole"
+          ]
+        }
+      }
+    }
+  ]
+}

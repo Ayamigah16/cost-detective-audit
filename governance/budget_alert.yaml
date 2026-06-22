@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cost Detective – AWS Budget with SNS email alert.
+  Creates a monthly budget that sends an email notification when:
+    (a) Actual spend exceeds 80% of threshold
+    (b) Actual spend exceeds 100% of threshold
+    (c) Forecasted spend is projected to exceed 100% of threshold
+
+Parameters:
+  BudgetName:
+    Type: String
+    Default: CostDetective-Monthly-Budget
+    Description: Name of the AWS Budget
+
+  BudgetLimitUSD:
+    Type: Number
+    Default: 50
+    Description: Monthly budget limit in USD
+
+  AlertEmail:
+    Type: String
+    Description: Email address to receive budget alerts (must confirm subscription)
+    AllowedPattern: "^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: Must be a valid email address
+
+  CostCenterFilter:
+    Type: String
+    Default: ""
+    Description: >
+      Optional — filter this budget to a specific CostCenter tag value.
+      Leave empty to apply to total account spend.
+
+Conditions:
+  HasCostCenterFilter: !Not [!Equals [!Ref CostCenterFilter, ""]]
+
+Resources:
+
+  # ── SNS Topic ────────────────────────────────────────────────────────────
+  BudgetAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${BudgetName}-alerts"
+      DisplayName: "AWS Budget Alert"
+      Tags:
+        - Key: Project
+          Value: CostDetective
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  BudgetAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref BudgetAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # SNS Topic Policy — allows AWS Budgets service to publish
+  BudgetAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BudgetAlertTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowBudgetsPublish
+            Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BudgetAlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ── AWS Budget ────────────────────────────────────────────────────────────
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Ref BudgetName
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref BudgetLimitUSD
+          Unit: USD
+        # Optional tag-based filter
+        CostFilters: !If
+          - HasCostCenterFilter
+          - TagKeyValue:
+              - !Sub "user:CostCenter$${CostCenterFilter}"
+          - !Ref AWS::NoValue
+
+      NotificationsWithSubscribers:
+        # Alert 1: Actual spend hits 80%
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+        # Alert 2: Actual spend hits 100%
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+        # Alert 3: Forecasted spend projected to exceed 100%
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+# ── Outputs ────────────────────────────────────────────────────────────────
+Outputs:
+  BudgetName:
+    Description: Name of the created AWS Budget
+    Value: !Ref BudgetName
+    Export:
+      Name: !Sub "${AWS::StackName}-BudgetName"
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic used for budget alerts
+    Value: !Ref BudgetAlertTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  BudgetConsoleURL:
+    Description: Direct link to AWS Budgets console
+    Value: !Sub "https://console.aws.amazon.com/billing/home#/budgets/details?name=${BudgetName}"

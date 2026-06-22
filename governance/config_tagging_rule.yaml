@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cost Detective – AWS Config required-tags compliance rule.
+  Evaluates EC2 instances and EBS volumes for mandatory cost allocation tags.
+  Non-compliant resources are flagged in the Config console and can trigger
+  an SNS notification for remediation workflows.
+
+Parameters:
+  RequiredTag1Key:
+    Type: String
+    Default: CostCenter
+    Description: First required tag key
+
+  RequiredTag2Key:
+    Type: String
+    Default: Environment
+    Description: Second required tag key
+
+  RequiredTag3Key:
+    Type: String
+    Default: Project
+    Description: Third required tag key
+
+  RequiredTag4Key:
+    Type: String
+    Default: Owner
+    Description: Fourth required tag key
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email for non-compliance notifications (optional)
+
+  EnableConfigRecorder:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set to 'true' only if AWS Config is NOT already enabled in this account/region.
+      If Config is already running, leave as 'false' to avoid conflicts.
+
+Conditions:
+  ShouldEnableConfig: !Equals [!Ref EnableConfigRecorder, "true"]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+
+  # ── Config Recorder (conditional — skip if Config already enabled) ────────
+  ConfigRecorderRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldEnableConfig
+    Properties:
+      RoleName: !Sub "ConfigRecorderRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Tags:
+        - Key: Project
+          Value: CostDetective
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldEnableConfig
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "config-delivery-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldConfigSnapshots
+            Status: Enabled
+            ExpirationInDays: 365
+      Tags:
+        - Key: Project
+          Value: CostDetective
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldEnableConfig
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ConfigBucket.Arn
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${ConfigBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Condition: ShouldEnableConfig
+    Properties:
+      Name: default
+      RoleARN: !GetAtt ConfigRecorderRole.Arn
+      RecordingGroup:
+        AllSupported: false
+        IncludeGlobalResourceTypes: false
+        ResourceTypes:
+          - AWS::EC2::Instance
+          - AWS::EC2::Volume
+          - AWS::EC2::NetworkInterface
+          - AWS::EC2::EIP
+
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Condition: ShouldEnableConfig
+    Properties:
+      Name: default
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  # ── Required-Tags Config Rule ─────────────────────────────────────────────
+  RequiredTagsRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: cost-detective-required-tags
+      Description: >
+        Checks that EC2 instances and EBS volumes have all mandatory
+        cost allocation tags (CostCenter, Environment, Project, Owner).
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+          - AWS::EC2::Volume
+      InputParameters:
+        tag1Key: !Ref RequiredTag1Key
+        tag2Key: !Ref RequiredTag2Key
+        tag3Key: !Ref RequiredTag3Key
+        tag4Key: !Ref RequiredTag4Key
+
+  # ── SNS for Config non-compliance alerts ─────────────────────────────────
+  ConfigAlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      TopicName: !Sub "config-compliance-alerts-${AWS::StackName}"
+      DisplayName: "Config Compliance Alert"
+      Tags:
+        - Key: Project
+          Value: CostDetective
+
+  ConfigAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref ConfigAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ── EventBridge rule: trigger on Config non-compliance ───────────────────
+  ConfigComplianceRule:
+    Type: AWS::Events::Rule
+    Condition: HasAlertEmail
+    Properties:
+      Name: !Sub "config-non-compliance-${AWS::StackName}"
+      Description: "Fires when a resource becomes NON_COMPLIANT with required-tags rule"
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          configRuleName:
+            - cost-detective-required-tags
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      State: ENABLED
+      Targets:
+        - Id: SendToSNS
+          Arn: !Ref ConfigAlertTopic
+
+  EventBridgeSNSPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasAlertEmail
+    Properties:
+      Topics:
+        - !Ref ConfigAlertTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridge
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ConfigAlertTopic
+
+  # ── SSM Automation: Auto-remediation dry-run document ────────────────────
+  RemediationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub "CostDetective-TagRemediation-${AWS::StackName}"
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        description: >
+          Placeholder remediation: applies a default 'UNTAGGED' CostCenter
+          tag to non-compliant EC2 instances. Replace with your actual tagging
+          workflow (e.g., Jira integration or self-service portal).
+        parameters:
+          InstanceId:
+            type: String
+            description: The EC2 Instance ID to remediate
+          AutomationAssumeRole:
+            type: String
+            description: Role ARN for SSM Automation
+        mainSteps:
+          - name: ApplyDefaultTag
+            action: aws:executeAwsApi
+            inputs:
+              Service: ec2
+              Api: CreateTags
+              Resources:
+                - "{{ InstanceId }}"
+              Tags:
+                - Key: CostCenter
+                  Value: "UNTAGGED-REMEDIATION-REQUIRED"
+                - Key: RemediatedBy
+                  Value: SSM-Automation
+
+# ── Outputs ────────────────────────────────────────────────────────────────
+Outputs:
+  ConfigRuleName:
+    Description: AWS Config rule name
+    Value: cost-detective-required-tags
+    Export:
+      Name: !Sub "${AWS::StackName}-ConfigRuleName"
+
+  ConfigConsoleURL:
+    Description: Direct link to the Config rule in the console
+    Value: !Sub "https://console.aws.amazon.com/config/home?region=${AWS::Region}#/rules/details?configRuleName=cost-detective-required-tags"
+
+  SNSTopicArn:
+    Description: SNS topic ARN for compliance alerts (if email provided)
+    Condition: HasAlertEmail
+    Value: !Ref ConfigAlertTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-ComplianceSNSArn"
